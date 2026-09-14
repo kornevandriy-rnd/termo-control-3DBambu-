@@ -3,10 +3,14 @@ Farm climate monitor — запуск на Raspberry Pi
 
 У цій папці лише те, що потрібно на Pi:
   - farm_monitor.py        (сама програма)
+  - farm_config.py         (розкладка/пороги/проводка — читає config.json)
   - run_on_pi.sh           (поставити Qt і запустити одним рядком)
+  - setup_hw.sh            (I2C + бібліотеки для реальних датчиків)
+  - i2c_scan.py            (перевірка проводки: що на яких каналах)
+  - check_config.py        (показати розкладку датчиків з config.json)
   - install_autostart.sh   (автозапуск-кіоск при ввімкненні Pi)
   - kiosk.sh               (фуллскрін-launcher, один екземпляр)
-  - config.example.json    (зразок налаштувань Telegram, опційно)
+  - config.example.json    (зразок config.json: розкладка, пороги, Telegram)
 
 КРОКИ
 -----
@@ -52,21 +56,26 @@ Farm climate monitor — запуск на Raspberry Pi
  - Вимкнути автозапуск: bash install_autostart.sh --remove (потім sudo reboot)
  - Ручний фуллскрін без автозапуску: python3 farm_monitor.py --fullscreen
 
-ТЕСТ РЕАЛЬНОГО ДАТЧИКА (один датчик, решта offline)
----------------------------------------------------
+РЕАЛЬНІ ДАТЧИКИ (плагінити по одному, від 1 до 21)
+--------------------------------------------------
+ Підтримка суміші: AHT10/AHT20 (0x38), HDC1080 (0x40), BMP280/BME280 (0x76/0x77,
+ тиск). Тип у кожному каналі визначається сам за I2C-адресою.
  Проводка (Pi -> TCA9548A -> датчик):
    Pi 3V3 (pin1) -> TCA VIN ; Pi GND (pin6) -> TCA GND
    Pi SDA (pin3) -> TCA SDA ; Pi SCL (pin5) -> TCA SCL
-   TCA A0/A1/A2 -> GND (адреса 0x70)
-   TCA канал 0: SD0 -> датчик SDA, SC0 -> датчик SCL ; VIN->3V3, GND->GND
+   TCA A0/A1/A2 -> GND (0x70); A0->3V3 (0x71); A1->3V3 (0x72)
+   TCA канал N: SDN -> датчик SDA, SCN -> датчик SCL ; VIN->3V3, GND->GND
+   Схема за замовч.: поверх 1->0x70, 2->0x71, 3->0x72 ; канал = стелаж - 1
  Кроки:
    bash setup_hw.sh                       # I2C + бібліотеки у .venv-hw
    (якщо I2C щойно увімкнено: sudo reboot)
-   i2cdetect -y 1                         # має бути 0x70
-   .venv-hw/bin/python i2c_scan.py        # ch0: 0x38(AHT20), 0x76/0x77(BMP280)
-   # за потреби виправ LIVE_SENSORS угорі farm_monitor.py (адреса BMP / канал)
+   i2cdetect -y 1                         # має бути 0x70 (та 0x71/0x72, якщо є)
+   .venv-hw/bin/python i2c_scan.py        # покаже 0x38/0x40/0x76 по каналах
+   python3 check_config.py                # (опційно) перевірити розкладку
    .venv-hw/bin/python farm_monitor.py --hardware
- Очікувано: Стелаж 1 / Нижній поверх - живий; решта сірі (offline); чип 1/21.
+ Очікувано: підключені датчики - живі; решта сірі (offline); чип N/21.
+ Розкладку/пороги/калібрування правиш у config.json (див. config.example.json),
+ код чіпати не треба.
 
 ЖИВЛЕННЯ (вимикач / розетка)
 ----------------------------
@@ -90,5 +99,5 @@ Farm climate monitor — запуск на Raspberry Pi
    Токен: @BotFather (/newbot). chat_id: @userinfobot.
    Порожній config = Telegram вимкнено. config.json нікуди не комітиться.
 
-Дані поки СИМУЛЬОВАНІ (рухаються) — це для перегляду інтерфейсу.
+Без заліза застосунок сам переходить у СИМУЛЯЦІЮ (для перегляду інтерфейсу).
 Демо: Стелаж 4 "гарячий" (тривога), Стелаж 6 / середній поверх - offline.

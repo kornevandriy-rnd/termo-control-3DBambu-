@@ -5,12 +5,20 @@ Native desktop app for the 3D-printing farm climate monitor. Designed for the
 Raspberry Pi 7" Touch Display 2 (portrait 720x1280) but runs on Windows/macOS/
 Linux for development.
 
-Currently shows SIMULATED data so you can see the interface without hardware.
-Tomorrow: replace SimulatedDataSource with a real source (sensors / InfluxDB).
-The UI only needs three methods from a data source:
+Real sensors are read via HardwareDataSource, which auto-detects a mix of
+sensor types per multiplexer channel:
+    AHT10 / AHT20  @ 0x38  (temperature + humidity)
+    HDC1080        @ 0x40  (temperature + humidity)
+    BMP280/BME280  @ 0x76/0x77  (pressure, best-effort add-on)
+so any sensor at hand can be wired into a channel and it just comes online.
+Without the hardware stack it falls back to SimulatedDataSource so you can see
+the interface. The UI only needs three methods from a data source:
     reading(rack, floor) -> Reading | None   (None == sensor offline)
     history(rack, floor) -> (temps, hums)     (empty lists if offline)
     step()                                    (advance / pull fresh values)
+
+Topology, I2C wiring, thresholds and calibration all come from config.json
+(see farm_config.py) — scaling from 1 to 21 sensors never needs a code edit.
 
 Alerts: a red banner appears on screen for any ALERT/offline sensor; if
 config.json holds a Telegram token + chat_id, alerts are also pushed there.
@@ -25,7 +33,7 @@ Keys: tap a rack tile / a top chip to drill in · "Назад" to return ·
 """
 from __future__ import annotations
 
-import json
+import csv
 import random
 import signal
 import subprocess
@@ -38,6 +46,8 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+import farm_config as fc
 
 try:
     from PySide6.QtCore import Qt, QTimer, QPointF
@@ -56,33 +66,48 @@ except ImportError:  # Raspberry Pi: PySide6 has no ARM wheel, use apt python3-p
 
 HERE = Path(__file__).resolve().parent
 
-# ---- configuration ---------------------------------------------------------
-RACKS = 7
-FLOORS = 3
-TOTAL = RACKS * FLOORS
-HISTORY = 60          # samples kept per sensor for the sparkline
-TICK_MS = 2000        # refresh / simulation step interval
+# ---- configuration (loaded from config.json, merged over farm_config.DEFAULTS)
+# These module-level names are set by _apply_config() so the rest of the UI can
+# keep referring to plain globals (RACKS, TEMP_WARN, FLOOR_NAMES, ...).
+CONFIG: dict = {}
+RACKS = FLOORS = TOTAL = COLUMNS = 0
+HISTORY = TICK_MS = 0
+TEMP_WARN = TEMP_ALERT = HUM_WARN = HUM_ALERT = 0.0
+ENTER_TICKS = CLEAR_TICKS = 0
+FLOOR_NAMES: dict[int, str] = {}
+SENSOR_MAP: list[dict] = []
 
-TEMP_WARN, TEMP_ALERT = 32.0, 38.0      # °C thresholds
-HUM_WARN, HUM_ALERT = 55.0, 65.0        # %RH thresholds
 
-# notification debounce (in ticks) to avoid flapping at the threshold
-ENTER_TICKS, CLEAR_TICKS = 2, 3
+def _apply_config(cfg: dict) -> None:
+    """Push a resolved config dict into the module globals used across the UI."""
+    global CONFIG, RACKS, FLOORS, TOTAL, COLUMNS, HISTORY, TICK_MS
+    global TEMP_WARN, TEMP_ALERT, HUM_WARN, HUM_ALERT
+    global ENTER_TICKS, CLEAR_TICKS, FLOOR_NAMES, SENSOR_MAP
+    CONFIG = cfg
+    RACKS = int(cfg["layout"]["racks"])
+    FLOORS = int(cfg["layout"]["floors"])
+    TOTAL = RACKS * FLOORS
+    COLUMNS = max(1, int(cfg["layout"].get("columns", 2)))
+    HISTORY = int(cfg["ui"]["history"])
+    TICK_MS = int(cfg["ui"]["tick_ms"])
+    th = cfg["thresholds"]
+    TEMP_WARN, TEMP_ALERT = float(th["temp_warn"]), float(th["temp_alert"])
+    HUM_WARN, HUM_ALERT = float(th["hum_warn"]), float(th["hum_alert"])
+    ENTER_TICKS = int(cfg["debounce"]["enter_ticks"])
+    CLEAR_TICKS = int(cfg["debounce"]["clear_ticks"])
+    FLOOR_NAMES = fc.floor_names(cfg)
+    SENSOR_MAP = fc.build_sensor_map(cfg)
 
-FLOOR_NAMES = {1: "Нижній поверх", 2: "Середній поверх", 3: "Верхній поверх"}
 
-# Wiring map for real sensors (AHT20, no pressure). Sensors not wired yet just
-# show "offline" — so all 21 can stay listed while you connect them one by one.
-# Scheme: one TCA9548A per floor, one channel per rack.
-#   floor 1 -> mux 0x70, floor 2 -> mux 0x71, floor 3 -> mux 0x72
-#   channel = rack - 1   (rack 1..7 -> channel 0..6)
-#   (rack, floor, mux_address, tca_channel)
-_FLOOR_MUX = {1: 0x70, 2: 0x71, 3: 0x72}
-LIVE_SENSORS = [
-    (rack, floor, _FLOOR_MUX[floor], rack - 1)
-    for floor in (1, 2, 3)
-    for rack in range(1, RACKS + 1)
-]
+# Load once at import so both the app and headless helpers see the same config.
+# A broken config.json must never leave the wall display on a black screen, so
+# we fall back to the defaults and surface the reason (printed by main()).
+CONFIG_ERROR = ""
+try:
+    _apply_config(fc.load_config(HERE / "config.json"))
+except fc.ConfigError as _exc:
+    CONFIG_ERROR = str(_exc)
+    _apply_config(fc.load_config(None))  # safe defaults
 
 # ---- palette (dark theme for a wall display) -------------------------------
 BG, CARD, CARD2 = "#0f1115", "#1a1d24", "#222730"
@@ -128,11 +153,14 @@ class SimulatedDataSource:
                 self.hist_t[(r, f)] = deque([base_t], maxlen=HISTORY)
                 self.hist_h[(r, f)] = deque([base_h], maxlen=HISTORY)
                 self.online[(r, f)] = True
-        # demo states: rack 4 runs hot (alert), one sensor is offline
+        # demo states: rack 4 runs hot (alert), one sensor is offline.
+        # Guarded so a smaller configured grid can't KeyError.
         for f in range(1, FLOORS + 1):
-            self._t[(4, f)] += 13
-            self._h[(4, f)] += 20
-        self.online[(6, 2)] = False
+            if (4, f) in self._t:
+                self._t[(4, f)] += 13
+                self._h[(4, f)] += 20
+        if (6, 2) in self.online:
+            self.online[(6, 2)] = False
 
     @staticmethod
     def _clamp(v, lo, hi):
@@ -161,66 +189,237 @@ class SimulatedDataSource:
         return list(self.hist_t[k]), list(self.hist_h[k])
 
 
+def _read_hdc1080(chan, addr=fc.ADDR_HDC1080):
+    """Trigger + read an HDC1080 over a busio-style I2C channel (from the mux).
+
+    Sequence per TI datasheet: set config MODE=1 (T then RH, 14-bit), write the
+    temperature-register pointer to start a conversion, wait, read 4 bytes."""
+    while not chan.try_lock():
+        time.sleep(0.005)
+    try:
+        chan.writeto(addr, bytes([0x02, 0x10, 0x00]))  # config: MODE=1, 14-bit
+        time.sleep(0.015)
+        chan.writeto(addr, bytes([0x00]))              # point at T reg -> triggers
+        time.sleep(0.02)                                # ~13 ms conversion + margin
+        buf = bytearray(4)
+        chan.readfrom_into(addr, buf)
+    finally:
+        chan.unlock()
+    raw_t = (buf[0] << 8) | buf[1]
+    raw_h = (buf[2] << 8) | buf[3]
+    return fc.hdc1080_convert(raw_t, raw_h)
+
+
+def _read_reg(chan, addr, reg):
+    """Read one register byte over a mux channel (used for BMP/BME chip-id)."""
+    while not chan.try_lock():
+        time.sleep(0.005)
+    try:
+        buf = bytearray(1)
+        chan.writeto_then_readfrom(addr, bytes([reg]), buf)
+    finally:
+        chan.unlock()
+    return buf[0]
+
+
 class HardwareDataSource:
-    """Real sensors via TCA9548A (Adafruit Blinka). I2C is polled in a background
-    thread so a slow/stuck bus never blocks the UI — the window opens instantly
-    and sensors that don't answer show as offline (None). Needs adafruit-blinka +
-    adafruit-circuitpython-ahtx0/-tca9548a (see setup_hw.sh)."""
+    """Real sensors via TCA9548A (Adafruit Blinka), mixed types, auto-detected.
 
-    def __init__(self):
-        import board
-        import busio
-        import adafruit_tca9548a
-        import adafruit_ahtx0
+    Per channel, after the mux selects it, the device is identified by its I2C
+    address and read with the right driver:
+        AHT10 / AHT20   0x38        temperature + humidity
+        HDC1080         0x40        temperature + humidity
+        BMP280/BME280   0x76/0x77   pressure add-on (best-effort)
+    A channel that doesn't answer yet stays offline and is retried, and muxes
+    plugged in later are picked up on a periodic rescan — so all 21 sensors can
+    be wired in one at a time without ever restarting the app. I2C is polled in
+    a background thread; the UI never blocks on a slow/stuck bus. Needs
+    adafruit-blinka + adafruit-circuitpython-ahtx0/-tca9548a (see setup_hw.sh);
+    HDC1080 needs no extra library.
+    """
 
-        self._mk_aht = adafruit_ahtx0.AHTx0
-        i2c = busio.I2C(board.SCL, board.SDA)
+    def __init__(self, i2c=None, tca_factory=None, start_thread=True):
+        # i2c / tca_factory are injectable for headless tests; in production they
+        # come from Adafruit Blinka (imported lazily so a dev PC needn't have it).
+        if i2c is None:
+            import board
+            import busio
+            i2c = busio.I2C(board.SCL, board.SDA)
+        if tca_factory is None:
+            import adafruit_tca9548a
+            tca_factory = adafruit_tca9548a.TCA9548A
 
-        # Which mux addresses actually respond right now. We only ever touch
-        # present muxes — an absent one is never accessed (it would stall the
-        # shared bus), its sensors simply stay offline.
-        while not i2c.try_lock():
-            time.sleep(0.01)
-        try:
-            present = set(i2c.scan())
-        finally:
-            i2c.unlock()
+        self._i2c = i2c
+        self._TCA = tca_factory
+        i2ccfg = CONFIG["i2c"]
+        self._redetect = float(i2ccfg.get("redetect_seconds", 5))
+        self._mux_rescan = float(i2ccfg.get("mux_rescan_seconds", 30))
+        self._auto = bool(i2ccfg.get("auto_detect", True))
 
-        self._sensors, self._latest = {}, {}
+        self._latest = {}
         self.hist_t, self.hist_h = {}, {}
-        muxes = {}
-        for rack, floor, mux_addr, channel in LIVE_SENSORS:
-            key = (rack, floor)
+        self._muxes = {}          # mux addr -> TCA9548A object
+        self._pos = []            # per-position runtime state
+        for p in SENSOR_MAP:
+            key = (p["rack"], p["floor"])
             self._latest[key] = None
             self.hist_t[key] = deque(maxlen=HISTORY)
             self.hist_h[key] = deque(maxlen=HISTORY)
-            if mux_addr not in present:
-                continue  # mux not connected -> stays offline, never polled
-            if mux_addr not in muxes:
-                muxes[mux_addr] = adafruit_tca9548a.TCA9548A(i2c, address=mux_addr)
-            self._sensors[key] = {"ch": muxes[mux_addr][channel], "aht": None}
+            self._pos.append({
+                "key": key, "mux": p["mux"], "channel": p["channel"],
+                "type": p["type"], "t_off": p["t_offset"], "h_off": p["h_offset"],
+                "chan": None, "reader": None, "next_detect": 0.0,
+            })
 
-        # Poll I2C off the UI thread; the window shows immediately.
+        self._present = set()
+        self._last_root_scan = 0.0
+        self._scan_root()         # first mux discovery + channel handles
+
         self._lock = threading.Lock()
-        threading.Thread(target=self._poll_loop, daemon=True).start()
+        if start_thread:
+            threading.Thread(target=self._poll_loop, daemon=True).start()
+
+    # --- bus / discovery ---------------------------------------------------
+    @staticmethod
+    def _scan_bus(bus):
+        while not bus.try_lock():
+            time.sleep(0.005)
+        try:
+            return set(bus.scan())
+        finally:
+            bus.unlock()
+
+    def _scan_root(self):
+        """(Re)discover which muxes respond; attach channel handles to positions."""
+        self._last_root_scan = time.monotonic()
+        try:
+            self._present = self._scan_bus(self._i2c)
+        except Exception:
+            return
+        for p in self._pos:
+            if p["chan"] is not None or p["mux"] is None:
+                continue
+            if p["mux"] not in self._present:
+                continue
+            if p["mux"] not in self._muxes:
+                try:
+                    self._muxes[p["mux"]] = self._TCA(self._i2c, address=p["mux"])
+                except Exception:
+                    continue
+            try:
+                p["chan"] = self._muxes[p["mux"]][p["channel"]]
+            except Exception:
+                p["chan"] = None
+
+    # --- per-sensor driver builders (return a reader, or None on failure) ---
+    @staticmethod
+    def _make_aht(chan):
+        try:
+            import adafruit_ahtx0
+            dev = adafruit_ahtx0.AHTx0(chan)  # AHT10 & AHT20 share this driver
+        except Exception:
+            return None
+        return lambda: (float(dev.temperature), float(dev.relative_humidity))
+
+    @staticmethod
+    def _make_hdc(chan, addr=fc.ADDR_HDC1080):
+        try:
+            _read_hdc1080(chan, addr)  # probe once so a dead sensor fails now
+        except Exception:
+            return None
+        return lambda: _read_hdc1080(chan, addr)
+
+    @staticmethod
+    def _make_bmp(chan, addr):
+        """BMP280/BME280 pressure. Chip-id picks the driver; a missing library
+        just means no pressure (never a crash)."""
+        try:
+            chip = _read_reg(chan, addr, 0xD0)
+        except Exception:
+            chip = None
+        dev = None
+        try:
+            if chip == 0x60:  # BME280
+                import adafruit_bme280.basic as adafruit_bme280
+                dev = adafruit_bme280.Adafruit_BME280_I2C(chan, address=addr)
+            else:             # BMP280 (0x58) or unknown -> try BMP280
+                import adafruit_bmp280
+                dev = adafruit_bmp280.Adafruit_BMP280_I2C(chan, address=addr)
+        except Exception:
+            return None
+        return lambda: float(dev.pressure)
+
+    def _detect(self, p):
+        """Scan a channel and bind a reader() -> (temp, hum, pressure), or None."""
+        chan = p["chan"]
+        try:
+            devs = self._scan_bus(chan)
+        except Exception:
+            return None
+        forced = p["type"]
+        read_th = None
+        if forced in ("aht", "aht10", "aht20"):
+            read_th = self._make_aht(chan)
+        elif forced in ("hdc1080", "hdc"):
+            read_th = self._make_hdc(chan)
+        elif self._auto and forced in ("", "auto"):
+            if fc.ADDR_AHT in devs:
+                read_th = self._make_aht(chan)
+            elif fc.ADDR_HDC1080 in devs:
+                read_th = self._make_hdc(chan)
+        if read_th is None:
+            return None  # no temperature/humidity source -> not a climate position
+
+        read_p = None
+        for a in (fc.ADDR_BMP_PRIMARY, fc.ADDR_BMP_SECONDARY):
+            if a in devs:
+                read_p = self._make_bmp(chan, a)
+                break
+
+        def read():
+            t, h = read_th()
+            pr = 0.0
+            if read_p is not None:
+                try:
+                    pr = read_p()
+                except Exception:
+                    pr = 0.0
+            return t, h, pr
+
+        return read
+
+    # --- polling -----------------------------------------------------------
+    def _poll_once(self):
+        """One full sweep of all positions. Split out so tests can drive it."""
+        now = time.monotonic()
+        if (now - self._last_root_scan >= self._mux_rescan and
+                any(p["chan"] is None and p["mux"] is not None for p in self._pos)):
+            self._scan_root()
+        for p in self._pos:
+            reading = None
+            if p["chan"] is not None:
+                if p["reader"] is None and now >= p["next_detect"]:
+                    p["reader"] = self._detect(p)
+                    p["next_detect"] = now + self._redetect
+                if p["reader"] is not None:
+                    try:
+                        t, h, pr = p["reader"]()
+                        t += p["t_off"]
+                        h += p["h_off"]
+                        reading = Reading(round(t, 2), round(h, 2), round(pr, 2))
+                    except Exception:
+                        p["reader"] = None            # force re-detect next cycle
+                        p["next_detect"] = now + self._redetect
+                        reading = None
+            with self._lock:
+                self._latest[p["key"]] = reading
+                if reading is not None:
+                    self.hist_t[p["key"]].append(reading.temperature)
+                    self.hist_h[p["key"]].append(reading.humidity)
 
     def _poll_loop(self):
         while True:
-            for key, s in self._sensors.items():
-                try:
-                    if s["aht"] is None:
-                        s["aht"] = self._mk_aht(s["ch"])
-                    t = round(float(s["aht"].temperature), 2)
-                    h = round(float(s["aht"].relative_humidity), 2)
-                    reading = Reading(t, h)
-                except Exception:
-                    s["aht"] = None       # drop handle so it re-inits next cycle
-                    reading = None
-                with self._lock:
-                    self._latest[key] = reading
-                    if reading is not None:
-                        self.hist_t[key].append(t)
-                        self.hist_h[key].append(h)
+            self._poll_once()
             time.sleep(TICK_MS / 1000.0)
 
     def step(self):
@@ -242,21 +441,14 @@ class HardwareDataSource:
 class AlertManager:
     LABEL = {"alert": "ТРИВОГА", "offline": "ДАТЧИК OFFLINE"}
 
-    def __init__(self, source, config_path=HERE / "config.json", log_path=HERE / "alerts.log"):
+    def __init__(self, source, log_path=HERE / "alerts.log"):
         self.source = source
         self.log_path = log_path
         self._active = {}    # key -> message (currently notified)
         self._streak = {}    # key -> consecutive present(+)/absent(-) ticks
-        self.tg_token, self.tg_chat = self._load_telegram(config_path)
-
-    @staticmethod
-    def _load_telegram(path):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                tg = json.load(fh).get("telegram", {})
-            return tg.get("token", "") or "", str(tg.get("chat_id", "") or "")
-        except (OSError, ValueError):
-            return "", ""
+        tg = CONFIG.get("telegram", {})
+        self.tg_token = str(tg.get("token", "") or "")
+        self.tg_chat = str(tg.get("chat_id", "") or "")
 
     def evaluate(self):
         """Recompute problems; fire transitions. Returns (n_alert, n_offline)."""
@@ -317,6 +509,51 @@ class AlertManager:
         try:
             urllib.request.urlopen(url, data=data, timeout=10).read()
         except Exception:
+            pass
+
+
+class ReadingsLogger:
+    """Optional CSV log of every sensor's reading, one row per (rack, floor) per
+    interval. OFF unless config.logging.readings_csv is set — on a read-only
+    overlay FS or to spare the SD card, leave it empty. Writes a header once."""
+
+    def __init__(self, source):
+        self.source = source
+        cfg = CONFIG.get("logging", {})
+        path = str(cfg.get("readings_csv", "") or "").strip()
+        self.path = (HERE / path) if path and not Path(path).is_absolute() else (
+            Path(path) if path else None)
+        self.every = max(1, int(cfg.get("log_every_ticks", 30)))
+        self._n = 0
+        if self.path and not self.path.exists():
+            try:
+                with open(self.path, "w", newline="", encoding="utf-8") as fh:
+                    csv.writer(fh).writerow(
+                        ["timestamp", "rack", "floor", "temperature", "humidity", "pressure"])
+            except OSError:
+                self.path = None
+
+    def tick(self):
+        if self.path is None:
+            return
+        self._n += 1
+        if self._n % self.every:
+            return
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = []
+        for r in range(1, RACKS + 1):
+            for f in range(1, FLOORS + 1):
+                rd = self.source.reading(r, f)
+                if rd is None:
+                    rows.append([stamp, r, f, "", "", ""])
+                else:
+                    p = f"{rd.pressure:.1f}" if getattr(rd, "pressure", 0.0) > 0 else ""
+                    rows.append([stamp, r, f, f"{rd.temperature:.2f}",
+                                 f"{rd.humidity:.2f}", p])
+        try:
+            with open(self.path, "a", newline="", encoding="utf-8") as fh:
+                csv.writer(fh).writerows(rows)
+        except OSError:
             pass
 
 
@@ -458,7 +695,10 @@ class FloorCard(QFrame):
         col = status_color(r.temperature, r.humidity)
         self._border(col)
         self.temp.setText(f"{r.temperature:.1f}°")
-        self.sub.setText(f"вологість {r.humidity:.0f}%")
+        sub = f"вологість {r.humidity:.0f}%"
+        if getattr(r, "pressure", 0.0) > 0:
+            sub += f"   ·   {r.pressure:.0f} гПа"
+        self.sub.setText(sub)
         self.state.setText(status_word(col))
         self.state.setStyleSheet(f"color: {col}; font-size: 14px;")
         self.spark.set_data(temps, hums)
@@ -565,7 +805,7 @@ class OverviewPage(QWidget):
         for rack in range(1, RACKS + 1):
             tile = ZoneTile(rack, on_open_rack)
             self.tiles[rack] = tile
-            grid.addWidget(tile, (rack - 1) // 2, (rack - 1) % 2)
+            grid.addWidget(tile, (rack - 1) // COLUMNS, (rack - 1) % COLUMNS)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 16, 18, 18)
@@ -764,6 +1004,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.source = source
         self.alerts = AlertManager(source)
+        self.logger = ReadingsLogger(source)
         self.setWindowTitle("Farm climate monitor")
         geo = QApplication.primaryScreen().availableGeometry()
         self.resize(min(560, int(geo.width() * 0.85)),
@@ -792,6 +1033,7 @@ class MainWindow(QMainWindow):
     def tick(self):
         self.source.step()
         self.alerts.evaluate()
+        self.logger.tick()
         cur = self.stack.currentWidget()
         if cur is self.detail:
             self.detail.refresh()
@@ -895,6 +1137,9 @@ def make_source():
 
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)  # Ctrl+C in the terminal quits
+    if CONFIG_ERROR:
+        print(f"[config] config.json problem, using defaults: {CONFIG_ERROR}")
+    print(f"[config] {RACKS} racks x {FLOORS} floors = {TOTAL} sensors")
     app = QApplication(sys.argv)
     app.setStyleSheet(QSS)
     win = MainWindow(make_source())

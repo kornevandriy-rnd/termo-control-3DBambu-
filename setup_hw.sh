@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Prepare the Pi to read real sensors (AHT20+BMP280 via TCA9548A).
+# Prepare the Pi to read the real sensor mix via TCA9548A:
+#   AHT10 / AHT20 (0x38), HDC1080 (0x40), BMP280 / BME280 (0x76/0x77).
+# HDC1080 is read directly (no extra library); the others use Adafruit libs.
 # Creates a venv that ALSO sees the apt PyQt6, and installs Adafruit libs.
 # Run on the Pi:  bash setup_hw.sh
 set -e
@@ -18,6 +20,7 @@ python3 -m venv --system-site-packages "$DIR/.venv-hw"
     adafruit-blinka \
     adafruit-circuitpython-ahtx0 \
     adafruit-circuitpython-bmp280 \
+    adafruit-circuitpython-bme280 \
     adafruit-circuitpython-tca9548a
 
 cat <<EOF
@@ -26,6 +29,7 @@ cat <<EOF
  1. (Якщо I2C щойно увімкнули) перезавантаж:   sudo reboot
  2. Швидка перевірка, що мультиплексор видно:   i2cdetect -y 1   (має бути 0x70)
  3. Перевірка датчиків по каналах:              .venv-hw/bin/python i2c_scan.py
- 4. За потреби виправ LIVE_SENSORS у farm_monitor.py (адреса/канал).
- 5. Запуск із реальним датчиком:                .venv-hw/bin/python farm_monitor.py --hardware
+ 4. (Опційно) виправ розкладку/пороги у config.json (див. config.example.json)
+    і перевір її:                               python3 check_config.py
+ 5. Запуск із реальними датчиками:              .venv-hw/bin/python farm_monitor.py --hardware
 EOF

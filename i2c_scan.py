@@ -2,7 +2,10 @@
 """Wiring check: scan each TCA9548A (0x70..0x77) channel and list devices.
 
 Run on the Pi (after setup_hw.sh):  .venv-hw/bin/python i2c_scan.py
-Expected per wired sensor:  AHT20 at 0x38, BMP280 at 0x76 or 0x77.
+Recognises the sensor mix used here:
+    AHT10 / AHT20   @ 0x38
+    HDC1080         @ 0x40
+    BMP280 / BME280 @ 0x76 / 0x77
 """
 import time
 
@@ -10,7 +13,8 @@ import board
 import busio
 
 MUX_ADDRESSES = range(0x70, 0x78)
-KNOWN = {0x38: "AHT20", 0x76: "BMP280", 0x77: "BMP280"}
+KNOWN = {0x38: "AHT10/AHT20", 0x40: "HDC1080", 0x76: "BMP280/BME280",
+         0x77: "BMP280/BME280"}
 
 
 def scan(bus):

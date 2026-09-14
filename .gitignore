@@ -1,0 +1,14 @@
+# Local, machine-specific config (Telegram token, wiring overrides, calibration)
+config.json
+
+# Runtime output
+alerts.log
+readings.csv
+*.csv
+
+# Python / virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+.venv-hw/
+venv/

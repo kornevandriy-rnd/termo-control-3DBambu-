@@ -1,4 +1,39 @@
 {
+  "layout": {
+    "racks": 7,
+    "floors": 3,
+    "columns": 2,
+    "floor_names": {
+      "1": "Нижній поверх",
+      "2": "Середній поверх",
+      "3": "Верхній поверх"
+    }
+  },
+
+  "thresholds": {
+    "temp_warn": 32.0,
+    "temp_alert": 38.0,
+    "hum_warn": 55.0,
+    "hum_alert": 65.0
+  },
+
+  "i2c": {
+    "floor_mux": { "1": "0x70", "2": "0x71", "3": "0x72" },
+    "channel_base": 0,
+    "auto_detect": true,
+    "redetect_seconds": 5,
+    "mux_rescan_seconds": 30
+  },
+
+  "sensors": [],
+
+  "calibration": {},
+
+  "logging": {
+    "readings_csv": "",
+    "log_every_ticks": 30
+  },
+
   "telegram": {
     "token": "",
     "chat_id": ""
