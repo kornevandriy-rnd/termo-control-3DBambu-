@@ -1,0 +1,48 @@
+{
+  "_comment": "Варіант B: мукс на кожен стелаж (0x70..0x76), канал = поверх-1. Скопіюй у config.json на RB: cp config.farm.json config.json",
+
+  "layout": {
+    "racks": 7,
+    "floors": 3,
+    "columns": 2,
+    "floor_names": { "1": "Нижній поверх", "2": "Середній поверх", "3": "Верхній поверх" }
+  },
+
+  "thresholds": { "temp_warn": 32.0, "temp_alert": 38.0, "hum_warn": 55.0, "hum_alert": 65.0 },
+
+  "i2c": { "auto_detect": true, "redetect_seconds": 5, "mux_rescan_seconds": 30 },
+
+  "sensors": [
+    { "rack": 1, "floor": 1, "mux": "0x70", "channel": 0 },
+    { "rack": 1, "floor": 2, "mux": "0x70", "channel": 1 },
+    { "rack": 1, "floor": 3, "mux": "0x70", "channel": 2 },
+
+    { "rack": 2, "floor": 1, "mux": "0x71", "channel": 0 },
+    { "rack": 2, "floor": 2, "mux": "0x71", "channel": 1 },
+    { "rack": 2, "floor": 3, "mux": "0x71", "channel": 2 },
+
+    { "rack": 3, "floor": 1, "mux": "0x72", "channel": 0 },
+    { "rack": 3, "floor": 2, "mux": "0x72", "channel": 1 },
+    { "rack": 3, "floor": 3, "mux": "0x72", "channel": 2 },
+
+    { "rack": 4, "floor": 1, "mux": "0x73", "channel": 0 },
+    { "rack": 4, "floor": 2, "mux": "0x73", "channel": 1 },
+    { "rack": 4, "floor": 3, "mux": "0x73", "channel": 2 },
+
+    { "rack": 5, "floor": 1, "mux": "0x74", "channel": 0 },
+    { "rack": 5, "floor": 2, "mux": "0x74", "channel": 1 },
+    { "rack": 5, "floor": 3, "mux": "0x74", "channel": 2 },
+
+    { "rack": 6, "floor": 1, "mux": "0x75", "channel": 0 },
+    { "rack": 6, "floor": 2, "mux": "0x75", "channel": 1 },
+    { "rack": 6, "floor": 3, "mux": "0x75", "channel": 2 },
+
+    { "rack": 7, "floor": 1, "mux": "0x76", "channel": 0 },
+    { "rack": 7, "floor": 2, "mux": "0x76", "channel": 1 },
+    { "rack": 7, "floor": 3, "mux": "0x76", "channel": 2 }
+  ],
+
+  "calibration": {},
+  "logging": { "readings_csv": "", "log_every_ticks": 30 },
+  "telegram": { "token": "", "chat_id": "" }
+}
